@@ -394,6 +394,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     }
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
+        // Bound the inbound payload decoded per poll (see
+        // `Config::set_max_inbound_bytes_per_poll`) so draining a large burst
+        // can't monopolise the executor; we self-wake to resume promptly.
+        let max_inbound_bytes_per_poll = self.config.max_inbound_bytes_per_poll;
+
+        let mut received_bytes = 0usize;
         loop {
             if self.socket.poll_ready_unpin(cx).is_ready() {
                 // Note `next_ping` does not register a waker and thus if not called regularly (idle
@@ -456,7 +462,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             if self.pending_read_frame.is_none() {
                 match self.socket.poll_next_unpin(cx) {
                     Poll::Ready(Some(frame)) => {
-                        match self.on_frame(frame?)? {
+                        let frame = frame?;
+                        // Only data frames carry a payload body; window-update,
+                        // ping and go-away frames are header-only.
+                        let data_len = if frame.header().tag() == Tag::Data {
+                            frame.header().len().val() as usize
+                        } else {
+                            0
+                        };
+                        match self.on_frame(frame)? {
                             Action::None => {}
                             Action::New(stream) => {
                                 log::trace!("{}: new inbound {} of {}", self.id, stream, self);
@@ -470,6 +484,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                                 log::trace!("{}: sending term", self.id);
                                 self.pending_read_frame.replace(f.into());
                             }
+                        }
+                        // Yield once we've decoded a budget's worth of inbound
+                        // payload this poll, self-waking so we resume promptly
+                        // after letting other tasks run.
+                        received_bytes += data_len;
+                        if received_bytes >= max_inbound_bytes_per_poll {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
                         }
                         continue;
                     }

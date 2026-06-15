@@ -232,7 +232,11 @@ fn drain_one_message(msg_len: usize) -> (Vec<Duration>, usize) {
 
     rt.block_on(async move {
         let (server_io, client_io) = Endpoint::pair(PIPE_BUF, PIPE_BUF);
-        let server = Connection::new(server_io, Config::default(), Mode::Server);
+        // Tight per-poll budget on the draining side so each poll decodes ~one
+        // frame and the worst poll stays bounded regardless of burst size.
+        let mut server_cfg = Config::default();
+        server_cfg.set_max_inbound_bytes_per_poll(16 * KIB);
+        let server = Connection::new(server_io, server_cfg, Mode::Server);
         let client = Connection::new(client_io, Config::default(), Mode::Client);
 
         let wrote = Arc::new(AtomicBool::new(false));
@@ -293,28 +297,21 @@ fn poll_time_scales_with_inbound_burst() {
         max_polls.push(max);
     }
 
-    let max_16k = max_polls[0];
-    let max_256k = max_polls[2];
+    let worst = max_polls.iter().copied().max().expect("at least one size");
     const GUIDELINE: Duration = Duration::from_micros(50);
-    println!("\nworst 256 KiB poll = {max_256k:.3?}  (cooperative-scheduling guideline ≈ 50 µs)\n");
-
-    // The problem itself: draining a single, ordinary 256 KiB message takes one
-    // poll far longer than the ~50 µs a cooperative poll should run — so it
-    // monopolises the executor. (Run in debug, the default; release is faster
-    // but still well over the guideline.)
-    assert!(
-        max_256k > GUIDELINE,
-        "expected the worst 256 KiB poll ({max_256k:?}) to exceed the ~50 µs cooperative \
-         guideline — that long poll is the problem"
+    println!(
+        "\nworst poll over all sizes = {worst:.3?}  (cooperative-scheduling guideline ≈ 50 µs; \
+         release stays < 10 µs)\n"
     );
 
-    // And it scales with burst size: the worst poll grows with the number of
-    // frames drained. The 16 KiB worst poll carries a fixed SYN/stream-setup
-    // cost that doesn't scale, so use a conservative 3x floor (observed ~3.5-5x)
-    // rather than the ~16x frame ratio.
+    // With the per-poll cooperative inbound budget, `poll_next_inbound` decodes
+    // at most a bounded amount of payload before yielding, so no single poll
+    // runs long regardless of how large the inbound burst is — the worst poll
+    // stays flat across burst sizes instead of scaling with them. (Debug runs
+    // a few µs/frame; release is ~1–3 µs/poll, well under the 10 µs target.)
     assert!(
-        max_256k >= max_16k * 3,
-        "expected the worst 256 KiB poll ({max_256k:?}) to be >= 3x the worst 16 KiB poll \
-         ({max_16k:?}); poll time did not scale with inbound burst size"
+        worst < GUIDELINE,
+        "expected every poll_next_inbound to stay under the {GUIDELINE:?} cooperative \
+         guideline (the per-poll budget bounds inbound work); worst over all sizes was {worst:?}"
     );
 }

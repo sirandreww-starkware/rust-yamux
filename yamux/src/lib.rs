@@ -67,6 +67,18 @@ const MAX_ACK_BACKLOG: usize = 256;
 /// https://github.com/paritytech/yamux/issues/100.
 const DEFAULT_SPLIT_SEND_SIZE: usize = 16 * KIB;
 
+/// Default maximum number of inbound payload bytes a single
+/// [`Connection::poll_next_inbound`] call decodes before yielding back to the
+/// executor.
+///
+/// Draining a large inbound burst (a full receive window, or many multiplexed
+/// streams) in one poll would otherwise run that poll for hundreds of
+/// microseconds and starve other tasks sharing the executor. Bounding the
+/// payload decoded per poll keeps every poll short (cooperative scheduling); the
+/// connection self-wakes to resume promptly. Defaults to one stream's worth
+/// (`DEFAULT_CREDIT`), so only larger bursts are affected.
+const DEFAULT_MAX_INBOUND_BYTES_PER_POLL: usize = DEFAULT_CREDIT as usize;
+
 /// Yamux configuration.
 ///
 /// The default configuration values are as follows:
@@ -75,12 +87,14 @@ const DEFAULT_SPLIT_SEND_SIZE: usize = 16 * KIB;
 /// - max. number of streams = 512
 /// - read after close = true
 /// - split send size = 16 KiB
+/// - max. inbound bytes decoded per poll = 256 KiB
 #[derive(Debug, Clone)]
 pub struct Config {
     max_connection_receive_window: Option<usize>,
     max_num_streams: usize,
     read_after_close: bool,
     split_send_size: usize,
+    max_inbound_bytes_per_poll: usize,
 }
 
 impl Default for Config {
@@ -90,6 +104,7 @@ impl Default for Config {
             max_num_streams: 512,
             read_after_close: true,
             split_send_size: DEFAULT_SPLIT_SEND_SIZE,
+            max_inbound_bytes_per_poll: DEFAULT_MAX_INBOUND_BYTES_PER_POLL,
         }
     }
 }
@@ -163,6 +178,19 @@ impl Config {
         self.split_send_size = n;
         self
     }
+
+    /// Set the maximum number of inbound payload bytes decoded per
+    /// [`Connection::poll_next_inbound`] call before yielding.
+    ///
+    /// Bounding this keeps each poll short regardless of how much inbound data
+    /// is buffered, so a large burst (or many multiplexed streams) can't
+    /// monopolise the executor (cooperative scheduling). Smaller values lower
+    /// per-poll latency at the cost of more polls; larger values approach
+    /// unbounded per-poll draining. Defaults to 256 KiB.
+    pub fn set_max_inbound_bytes_per_poll(&mut self, n: usize) -> &mut Self {
+        self.max_inbound_bytes_per_poll = n;
+        self
+    }
 }
 
 // Check that we can safely cast a `usize` to a `u64`.
@@ -191,6 +219,7 @@ impl quickcheck::Arbitrary for Config {
             max_num_streams,
             read_after_close: bool::arbitrary(g),
             split_send_size: g.gen_range(DEFAULT_SPLIT_SEND_SIZE..usize::MAX),
+            max_inbound_bytes_per_poll: g.gen_range(DEFAULT_SPLIT_SEND_SIZE..usize::MAX),
         }
     }
 }
